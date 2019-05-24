@@ -129,6 +129,10 @@ func defaultDeclarations() cel.EnvOption {
 		decls.NewIdent(PreKey+"_params", decls.NewMapType(decls.String, decls.String), nil),
 		decls.NewIdent(PreKey+"_headers", decls.NewMapType(decls.String, decls.NewListType(decls.String)), nil),
 		decls.NewIdent(PreKey+"_querystring", decls.NewMapType(decls.String, decls.NewListType(decls.String)), nil),
+		// jwt is part of the "pre" values; now it's possible to do something like: req_jwt.userID == req_params.userID
+		decls.NewIdent(PreKey+"_jwt", decls.NewMapType(decls.String, decls.Dyn), nil),
+		// body contains "application/json" or "multipart/form-data" data as map[string]interface{}
+		decls.NewIdent(PreKey+"_body", decls.NewMapType(decls.String, decls.Dyn), nil),
 
 		decls.NewIdent(PostKey+"_completed", decls.Bool, nil),
 		decls.NewIdent(PostKey+"_metadata_status", decls.Int, nil),

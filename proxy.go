@@ -1,8 +1,14 @@
 package cel
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/devopsfaith/krakend-cel/internal"
@@ -10,6 +16,14 @@ import (
 	"github.com/devopsfaith/krakend/logging"
 	"github.com/devopsfaith/krakend/proxy"
 	"github.com/google/cel-go/cel"
+)
+
+const (
+	authHeader        = "Authorization"
+	contentTypeHeader = "Content-Type"
+	contentTypeJson   = "application/json"
+	contentTypeForm   = "multipart/form-data"
+	tokenPrefix       = "Bearer "
 )
 
 func ProxyFactory(l logging.Logger, pf proxy.Factory) proxy.Factory {
@@ -74,7 +88,7 @@ func newProxy(l logging.Logger, name string, defs []internal.InterpretableDefini
 	return func(ctx context.Context, r *proxy.Request) (*proxy.Response, error) {
 		now := timeNow().Format(time.RFC3339)
 
-		if err := evalChecks(l, name+"-pre", newReqActivation(r, now), preEvaluators); err != nil {
+		if err := evalChecks(l, name+"-pre", newReqActivation(l, r, now), preEvaluators); err != nil {
 			return nil, err
 		}
 
@@ -106,7 +120,10 @@ func evalChecks(l logging.Logger, name string, args map[string]interface{}, ps [
 	return nil
 }
 
-func newReqActivation(r *proxy.Request, now string) map[string]interface{} {
+func newReqActivation(l logging.Logger, r *proxy.Request, now string) map[string]interface{} {
+	jwtData := parseJWT(l, r)
+	bodyData := parseBody(l, r)
+
 	return map[string]interface{}{
 		internal.PreKey + "_method":      r.Method,
 		internal.PreKey + "_path":        r.Path,
@@ -114,6 +131,8 @@ func newReqActivation(r *proxy.Request, now string) map[string]interface{} {
 		internal.PreKey + "_headers":     r.Headers,
 		internal.PreKey + "_querystring": r.Query,
 		internal.NowKey:                  now,
+		internal.PreKey + "_jwt":         /*nil*/ jwtData,
+		internal.PreKey + "_body":        /*nil*/ bodyData,
 	}
 }
 
@@ -128,3 +147,71 @@ func newRespActivation(r *proxy.Response, now string) map[string]interface{} {
 }
 
 var timeNow = time.Now
+
+func parseJWT(l logging.Logger, r *proxy.Request) map[string]interface{} {
+	var jwtData map[string]interface{}
+	if len(r.Headers[authHeader]) == 0 {
+		return nil
+	}
+	jwt := r.Headers[authHeader][0]
+	if strings.HasPrefix(jwt, tokenPrefix) {
+		jwt = jwt[len(tokenPrefix):]
+	} else {
+		l.Debug("Auth header found but without token prefix \"%v\"", tokenPrefix)
+		return nil
+	}
+	jwtParts := strings.Split(jwt, ".")
+	if len(jwtParts) < 3 {
+		l.Error("%v token found, but with %d parts", tokenPrefix, len(jwtParts))
+		return nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(jwtParts[1])
+	if err != nil {
+		l.Error("Decode jwt: %v", err.Error())
+		return nil
+	} else {
+		if err := json.Unmarshal([]byte(data), &jwtData); err != nil {
+			l.Error("Unmarshal jwt: %v", err.Error())
+			return nil
+		}
+	}
+	return jwtData
+}
+
+func parseBody(l logging.Logger, r *proxy.Request) map[string]interface{} {
+	bodyData := make(map[string]interface{})
+	if len(r.Headers[contentTypeHeader]) == 0 {
+		return nil
+	}
+	if r.Body == nil {
+		return nil
+	}
+	bodyBytes, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		l.Error("Read body: %v", err.Error())
+		return nil
+	}
+	r.Body.Close()
+	r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+	//fmt.Printf("BODY BYTES: %v\n", string(bodyBytes))
+	if strings.Contains(r.Headers[contentTypeHeader][0], contentTypeJson) {
+		if err := json.Unmarshal(bodyBytes, &bodyData); err != nil {
+			l.Error("Unmarshal body: %v", err.Error())
+			return nil
+		}
+	} else if strings.Contains(r.Headers[contentTypeHeader][0], contentTypeForm) {
+		newBodyReader := ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+		req := http.Request{Method: r.Method, Header: r.Headers, Body: newBodyReader}
+		if err = req.ParseMultipartForm(32*1024*1024); err != nil {
+			l.Error("ParseForm: %v", err.Error())
+			return nil
+		}
+		newBodyReader.Close()
+		for key, values := range req.MultipartForm.Value {
+			if len(values) > 0 {
+				bodyData[key] = values[0]
+			}
+		}
+	}
+	return bodyData
+}
